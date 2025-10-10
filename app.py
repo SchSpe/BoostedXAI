@@ -4,36 +4,64 @@ import numpy as np
 from anchor import anchor_tabular
 import dill
 import os
+import dice_ml
+from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+def train_mlp(data, target):
+
+    X = data.drop(columns=[target])
+    y = data[target]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    model = make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(50, 25), max_iter=500, random_state=42))
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    return model, acc
+
 
 st.header("BoostedXAI: :blue[Anchors] and :orange[Counterfactuals]", divider=True)
 
 with st.container(border=True):
     datafile = st.file_uploader("Upload CSV", type=["csv"])
-    modelfile = st.file_uploader("Upload Model", type=["pkl", "joblib", "modelfile"])
+    custom = st.toggle("Use custom model", value=False)
+    st.caption("If not using a custom model, a default MLP classifier will be trained on the uploaded data.")
+    if custom:
+        modelfile = st.file_uploader("Upload Model", type=["pkl", "joblib", "modelfile"])
 
-if datafile and modelfile:
+        if modelfile:
+            # Getting model from uploaded file
+            if "temp" not in os.listdir():
+                os.mkdir("./temp")
+
+            with open("./temp/temp_model.modelfile", "wb") as f:
+                f.write(modelfile.getvalue())
+            with open("./temp/temp_model.modelfile", "rb") as f:
+                model = dill.load(f)
+
+            r, c = st.session_state["data"].shape
+                    
+            st.session_state["model"] = model
+
+
+if datafile:
     data = pd.read_csv(datafile)
     st.session_state["data"] = data 
     features = data.keys().to_list()
 
-    # Getting model from uploaded file
-    if "temp" not in os.listdir():
-        os.mkdir("./temp")
-
-    with open("./temp/temp_model.modelfile", "wb") as f:
-        f.write(modelfile.getvalue())
-    with open("./temp/temp_model.modelfile", "rb") as f:
-        model = dill.load(f)
-
-    r, c = st.session_state["data"].shape
-            
-    st.session_state["model"] = model
 
     # Set Target Feature
     with st.container(border=True):
         target = st.segmented_control("Target Feature:", options=features, selection_mode="single", key="target_feature")
         st.markdown(f"Target Feature: {target}")
         if target:
+            st.session_state["y_true"] = data[target]
             # Default class labels = original target values (reset when target changes)
             orig_classes = pd.Series(data[target]).dropna().unique().tolist()
             if st.session_state.get("target_feature_prev") != target:
@@ -86,7 +114,7 @@ if datafile and modelfile:
         ]
         st.session_state["categorical_names"] = categorical_names_map
 
-        # Encode selected categorical columns to integer codes
+        # Encode selected categorical columns
         X = data[features].copy()
         for c in selected_cats:
             idx = name_to_idx[c]
@@ -109,6 +137,12 @@ if datafile and modelfile:
         else:
             st.info("No categorical features selected.")
 
+    # Train model if not using custom model
+    if target and not custom:
+        model, acc = train_mlp(data, target)
+        st.session_state["model"] = model
+        st.success(f"Model trained with accuracy: {acc:.2%}")
+
 # Initialize Anchor Explainer when prerequisites are met
 if "data" in st.session_state and "model" in st.session_state and "target_feature" in st.session_state:
     train = st.session_state["data"]
@@ -120,7 +154,7 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
         categorical_names=st.session_state.get("categorical_names", None),
     )
 
-    # Choose a row to explain, or enter a custom row
+    # Choose a row to anchor, or enter a custom row
     with st.container(border=True):
         use_custom = st.checkbox("Enter a custom row to explain", value=False)
         if use_custom:
@@ -134,9 +168,101 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
             st.markdown("**Selected row**")
             st.dataframe(pd.DataFrame([row], columns=features), hide_index=True)
 
-        exp = explainer.explain_instance(row, model.predict, threshold=0.95)
-        with st.container(border=True):
-            st.subheader("Anchor Explanation")
-            st.write('Anchor: %s' % (' AND '.join(exp.names())))
-            st.write('Precision: %.2f' % exp.precision())
-            st.write('Coverage: %.2f' % exp.coverage())
+        col1, col2 = st.columns(2)
+        with col1:
+            exp = explainer.explain_instance(row, model.predict, threshold=0.95)
+            with st.container(border=True):
+                st.subheader("Anchor Explanation")
+                st.write('Anchor: %s' % (' AND '.join(exp.names())))
+                st.write('Precision: %.2f' % exp.precision())
+                st.write('Coverage: %.2f' % exp.coverage())
+        with col2:
+            with st.container(border=True):
+                st.subheader("Counterfactual Explanation")
+                try:
+                    with st.spinner("Generating counterfactuals..."):
+                        # Prepare DiCE input from the encoded training matrix + target
+                        X_train_df = pd.DataFrame(train, columns=features)
+                        y_train = pd.Series(st.session_state.get("y_true"))
+                        train_df = X_train_df.copy()
+                        train_df[target] = y_train.values
+
+                        # Identify continuous features (non-categorical)
+                        cat_idx = st.session_state.get("categorical_features", [])
+                        cat_names = [features[i] for i in cat_idx if i < len(features)]
+                        cont_features = [c for c in X_train_df.columns if c not in cat_names]
+
+                        data_dice = dice_ml.Data(
+                            dataframe=train_df,
+                            continuous_features=cont_features,
+                            outcome_name=target
+                        )
+                        model_dice = dice_ml.Model(model=model, backend="sklearn")
+                        exp_dice = dice_ml.Dice(data_dice, model_dice, method='random')
+
+                        # Determine desired class
+                        classes = getattr(model, 'classes_', np.array(st.session_state.get('class_names', [])))
+                        n_classes = len(classes)
+                        instance_df = pd.DataFrame([row], columns=features)
+                        if n_classes == 2:
+                            desired_class = "opposite"
+                        else:
+                            current_pred = model.predict(instance_df.to_numpy())[0]
+                            try:
+                                i = int(np.where(classes == current_pred)[0][0])
+                                desired_class = classes[(i + 1) % n_classes]
+                            except Exception:
+                                desired_class = classes[0] if n_classes else 0
+
+                        cf = exp_dice.generate_counterfactuals(
+                            instance_df,
+                            total_CFs=3,
+                            desired_class=desired_class
+                        )
+
+                        cf_df = cf.cf_examples_list[0].final_cfs_df if hasattr(cf, 'cf_examples_list') else None
+                        if cf_df is not None and len(cf_df) > 0:
+                            #st.dataframe(cf_df, use_container_width=True)
+
+                            # Show key changes relative to original row, note if an anchor feature changed
+                            #st.markdown("**Key Changes:**")
+                            anchor_conditions = exp.names()
+                            anchor_features = {f for f in features for cond in anchor_conditions if f in cond}
+                            for cf_idx in range(len(cf_df)):
+                                changes = []
+                                for col in X_train_df.columns:
+                                    original = float(instance_df.iloc[0][col])
+                                    cf_val = float(cf_df.iloc[cf_idx][col])
+                                    if abs(original - cf_val) > 1e-6:
+                                        in_anchor = col in anchor_features
+                                        emoji = "❌" if in_anchor else "✅"
+                                        changes.append(f"{emoji} {col}: {original:.2f} → {cf_val:.2f}")
+                                if changes:
+                                        st.markdown(f"**Counterfactual {cf_idx + 1}:**")
+                                        for change in changes:
+                                            st.write(change)
+                                        st.divider()
+                        else:
+                            st.warning("No counterfactuals generated")
+                except Exception as e:
+                    st.error(f"Counterfactual error: {str(e)}")
+
+        # analysis 
+        if 'anchor_features' in locals() and anchor_features:
+            st.markdown("---")
+            st.subheader("📊 Agreement Analysis")
+            
+            if 'cf_df' in locals() and cf_df is not None:
+                disagreements = []
+                for col in anchor_features:
+                    for cf_idx in range(len(cf_df)):
+                        if abs(instance_df.iloc[0][col] - cf_df.iloc[cf_idx][col]) > 1e-6:
+                            disagreements.append(col)
+                            break
+                
+                if disagreements:
+                    st.error(f"⚠️ Counterfactuals DISAGREE with anchor on: {', '.join(disagreements)}")
+                    st.caption("These features are critical decision boundaries")
+                else:
+                    st.success("✅ Counterfactuals AGREE - they don't change anchor features")
+                    st.caption("Anchor features are stable; other features drive the change")
