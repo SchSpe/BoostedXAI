@@ -110,7 +110,7 @@ if datafile and modelfile:
             st.info("No categorical features selected.")
 
 # Initialize Anchor Explainer when prerequisites are met
-if datafile and modelfile and features:
+if "data" in st.session_state and "model" in st.session_state and "target_feature" in st.session_state:
     train = st.session_state["data"]
 
     explainer = anchor_tabular.AnchorTabularExplainer(
@@ -120,9 +120,23 @@ if datafile and modelfile and features:
         categorical_names=st.session_state.get("categorical_names", None),
     )
 
-    # Note: does not ask user for which instance to explain; yields error: UserWarning: X does not have valid feature names
-    i_row = 0
-    exp = explainer.explain_instance(train[i_row], model.predict, threshold=0.95)
-    st.write('Anchor: %s' % (' AND '.join(exp.names())))
-    st.write('Precision: %.2f' % exp.precision())
-    st.write('Coverage: %.2f' % exp.coverage())
+    # Choose a row to explain, or enter a custom row
+    with st.container(border=True):
+        use_custom = st.checkbox("Enter a custom row to explain", value=False)
+        if use_custom:
+            df_one = pd.DataFrame([train[0]], columns=features)
+            edited = st.data_editor(df_one, hide_index=True, num_rows="fixed")
+            row = edited.iloc[0].to_numpy()
+        else:
+            n_rows = int(train.shape[0])
+            i_row = st.number_input("Row index to explain", min_value=0, max_value=max(0, n_rows-1), value=0, step=1)
+            row = train[int(i_row)]
+            st.markdown("**Selected row**")
+            st.dataframe(pd.DataFrame([row], columns=features), hide_index=True)
+
+        exp = explainer.explain_instance(row, model.predict, threshold=0.95)
+        with st.container(border=True):
+            st.subheader("Anchor Explanation")
+            st.write('Anchor: %s' % (' AND '.join(exp.names())))
+            st.write('Precision: %.2f' % exp.precision())
+            st.write('Coverage: %.2f' % exp.coverage())
