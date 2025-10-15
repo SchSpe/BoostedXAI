@@ -11,11 +11,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-def train_mlp(data, target):
-
-    X = data.drop(columns=[target])
-    y = data[target]
-
+def train_mlp(X, y):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     model = make_pipeline(StandardScaler(), MLPClassifier(hidden_layer_sizes=(50, 25), max_iter=500, random_state=42))
@@ -45,16 +41,13 @@ with st.container(border=True):
             with open("./temp/temp_model.modelfile", "rb") as f:
                 model = dill.load(f)
 
-            r, c = st.session_state["data"].shape
-                    
             st.session_state["model"] = model
 
 
 if datafile:
     data = pd.read_csv(datafile)
-    st.session_state["data"] = data 
+    st.session_state["raw_data"] = data
     features = data.keys().to_list()
-
 
     # Set Target Feature
     with st.container(border=True):
@@ -62,7 +55,7 @@ if datafile:
         st.markdown(f"Target Feature: {target}")
         if target:
             st.session_state["y_true"] = data[target]
-            # Default class labels = original target values (reset when target changes)
+            # Default class labels
             orig_classes = pd.Series(data[target]).dropna().unique().tolist()
             if st.session_state.get("target_feature_prev") != target:
                 st.session_state["class_names"] = [str(x) for x in orig_classes]
@@ -77,7 +70,7 @@ if datafile:
                 st.session_state["edit_classes_open"] = not st.session_state.get("edit_classes_open", False)
                 st.rerun()
 
-            # Editable table only when editing is toggled on; defaults to original values
+            # Editable table only when editing is toggled on
             if st.session_state.get("edit_classes_open", False):
                 df = pd.DataFrame({"Class": orig_classes, "Name": st.session_state["class_names"]})
                 edited_df = st.data_editor(
@@ -90,20 +83,19 @@ if datafile:
                     })
                 st.session_state["class_names"] = edited_df['Name'].tolist()
 
-            # Remove target from feature list used elsewhere
+            # Remove target from feature list
             features.remove(target)
-
 
     # Set Categorical Features
     with st.container(border=True):
         categorical_features = st.segmented_control("Select Categorical Features", options=features, selection_mode="multi")
         st.markdown(f"Categorical Features: {categorical_features}")
 
-        # String/object columns are automatically treated as categorical
+        # Auto-detect object columns as categorical
         auto_cats = [c for c in features if data[c].dtype == object or getattr(data[c].dtype, 'name', '') == 'object']
         selected_cats = sorted(set(categorical_features).union(auto_cats), key=lambda n: features.index(n))
 
-        # Automatic inference of categorical labels
+        # Map categorical names
         name_to_idx = {c: i for i, c in enumerate(features)}
         categorical_names_map = {
             name_to_idx[c]: pd.Series(data[c]).dropna().unique().astype(str).tolist()
@@ -114,15 +106,17 @@ if datafile:
         ]
         st.session_state["categorical_names"] = categorical_names_map
 
-        # Encode selected categorical columns
+        # Encode categorical features
         X = data[features].copy()
         for c in selected_cats:
             idx = name_to_idx[c]
             order = st.session_state["categorical_names"][idx]
             X[c] = pd.Categorical(X[c].astype(str), categories=order).codes
-        st.session_state["data"] = X.values
 
-        # Preview of inferred categorical labels
+        st.session_state["encoded_data"] = X
+        st.session_state["data_matrix"] = X.values
+
+        # Preview
         idx_to_name = {i: c for c, i in name_to_idx.items()}
         preview_rows = []
         for idx in sorted(categorical_names_map.keys()):
@@ -139,13 +133,16 @@ if datafile:
 
     # Train model if not using custom model
     if target and not custom:
-        model, acc = train_mlp(data, target)
+        X_encoded = st.session_state["encoded_data"].copy()
+        y_encoded = data[target]
+
+        model, acc = train_mlp(X_encoded, y_encoded)
         st.session_state["model"] = model
         st.success(f"Model trained with accuracy: {acc:.2%}")
 
-# Initialize Anchor Explainer when prerequisites are met
-if "data" in st.session_state and "model" in st.session_state and "target_feature" in st.session_state:
-    train = st.session_state["data"]
+# Initialize Anchor Explainer
+if "data_matrix" in st.session_state and "model" in st.session_state and "target_feature" in st.session_state:
+    train = st.session_state["data_matrix"]
 
     explainer = anchor_tabular.AnchorTabularExplainer(
         class_names=st.session_state.get("class_names", None),
@@ -154,7 +151,7 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
         categorical_names=st.session_state.get("categorical_names", None),
     )
 
-    # Choose a row to anchor, or enter a custom row
+    # Choose row
     with st.container(border=True):
         use_custom = st.checkbox("Enter a custom row to explain", value=False)
         if use_custom:
@@ -170,7 +167,7 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
 
         col1, col2 = st.columns(2)
         with col1:
-            exp = explainer.explain_instance(row, model.predict, threshold=0.95)
+            exp = explainer.explain_instance(row, st.session_state["model"].predict, threshold=0.95)
             with st.container(border=True):
                 st.subheader("Anchor Explanation")
                 st.write('Anchor: %s' % (' AND '.join(exp.names())))
@@ -181,13 +178,11 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
                 st.subheader("Counterfactual Explanation")
                 try:
                     with st.spinner("Generating counterfactuals..."):
-                        # Prepare DiCE input from the encoded training matrix + target
                         X_train_df = pd.DataFrame(train, columns=features)
                         y_train = pd.Series(st.session_state.get("y_true"))
                         train_df = X_train_df.copy()
                         train_df[target] = y_train.values
 
-                        # Identify continuous features (non-categorical)
                         cat_idx = st.session_state.get("categorical_features", [])
                         cat_names = [features[i] for i in cat_idx if i < len(features)]
                         cont_features = [c for c in X_train_df.columns if c not in cat_names]
@@ -197,17 +192,16 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
                             continuous_features=cont_features,
                             outcome_name=target
                         )
-                        model_dice = dice_ml.Model(model=model, backend="sklearn")
+                        model_dice = dice_ml.Model(model=st.session_state["model"], backend="sklearn")
                         exp_dice = dice_ml.Dice(data_dice, model_dice, method='random')
 
-                        # Determine desired class
-                        classes = getattr(model, 'classes_', np.array(st.session_state.get('class_names', [])))
+                        classes = getattr(st.session_state["model"], 'classes_', np.array(st.session_state.get('class_names', [])))
                         n_classes = len(classes)
                         instance_df = pd.DataFrame([row], columns=features)
                         if n_classes == 2:
                             desired_class = "opposite"
                         else:
-                            current_pred = model.predict(instance_df.to_numpy())[0]
+                            current_pred = st.session_state["model"].predict(instance_df.to_numpy())[0]
                             try:
                                 i = int(np.where(classes == current_pred)[0][0])
                                 desired_class = classes[(i + 1) % n_classes]
@@ -222,10 +216,6 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
 
                         cf_df = cf.cf_examples_list[0].final_cfs_df if hasattr(cf, 'cf_examples_list') else None
                         if cf_df is not None and len(cf_df) > 0:
-                            #st.dataframe(cf_df, use_container_width=True)
-
-                            # Show key changes relative to original row, note if an anchor feature changed
-                            #st.markdown("**Key Changes:**")
                             anchor_conditions = exp.names()
                             anchor_features = {f for f in features for cond in anchor_conditions if f in cond}
                             for cf_idx in range(len(cf_df)):
@@ -238,16 +228,16 @@ if "data" in st.session_state and "model" in st.session_state and "target_featur
                                         emoji = "❌" if in_anchor else "✅"
                                         changes.append(f"{emoji} {col}: {original:.2f} → {cf_val:.2f}")
                                 if changes:
-                                        st.markdown(f"**Counterfactual {cf_idx + 1}:**")
-                                        for change in changes:
-                                            st.write(change)
-                                        st.divider()
+                                    st.markdown(f"**Counterfactual {cf_idx + 1}:**")
+                                    for change in changes:
+                                        st.write(change)
+                                    st.divider()
                         else:
                             st.warning("No counterfactuals generated")
                 except Exception as e:
                     st.error(f"Counterfactual error: {str(e)}")
 
-        # analysis 
+        # Agreement analysis
         if 'anchor_features' in locals() and anchor_features:
             st.markdown("---")
             st.subheader("📊 Agreement Analysis")
