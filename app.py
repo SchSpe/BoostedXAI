@@ -10,8 +10,6 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-import pickle
-import joblib
 
 def train_mlp(X, y):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -22,6 +20,57 @@ def train_mlp(X, y):
 
     acc = accuracy_score(y_test, y_pred)
     return model, acc
+
+def necessity_test(exp_dice, instance_df, desired_class, feature):
+    # A feature value xi is necessary for causing the model output y if changing xi changes the model output, while keeping every other feature constant.
+    # If features_to_vary is set to , then the generated counterfactuals demonstrate the necessity of the feature
+    vary_list = [feature] if isinstance(feature, str) else list(feature)
+    cf = exp_dice.generate_counterfactuals(
+        instance_df,
+        total_CFs=3,
+        desired_class=desired_class,
+        features_to_vary=vary_list,
+    )
+    cf_df = None
+    if hasattr(cf, 'cf_examples_list') and cf.cf_examples_list:
+        cf_df = getattr(cf.cf_examples_list[0], 'final_cfs_df', None)
+    return cf_df is not None and len(cf_df) > 0
+
+def sufficiency_test(exp_dice, instance_df, desired_class, feature):
+    # A feature value  is sufficient for causing the model output  if it is impossible to change the model output while keeping  constant.
+    # If features_to_vary is set to all features except , then the absence of any counterfactuals demonstrates the sufficiency of the feature.
+    all_cols = list(instance_df.columns)
+    vary_list = [c for c in all_cols if c != feature]
+    cf = exp_dice.generate_counterfactuals(
+        instance_df,
+        total_CFs=3,
+        desired_class=desired_class,
+        features_to_vary=vary_list if vary_list else 'none',
+    )
+    cf_df = None
+    if hasattr(cf, 'cf_examples_list') and cf.cf_examples_list:
+        cf_df = getattr(cf.cf_examples_list[0], 'final_cfs_df', None)
+    return (cf_df is None) or (len(cf_df) == 0)
+
+
+def nec_and_suf_ui(exp_dice, instance_df, desired_class, anchor_features):
+    st.markdown("### 🔍 Necessity and Sufficiency Tests")
+    st.caption("Test if anchor features are necessary or sufficient for the model's prediction.")
+
+    for feature in anchor_features:
+        try:
+            is_necessary = necessity_test(exp_dice, instance_df, desired_class, feature)
+            is_sufficient = sufficiency_test(exp_dice, instance_df, desired_class, feature)
+            col1, col2 = st.columns(2)
+            with col1:
+                emoji_n = "✅" if is_necessary else "❌"
+                st.write(f"{emoji_n} **{feature} is{' ' if is_necessary else ' not '}necessary**")
+            with col2:
+                emoji_s = "✅" if is_sufficient else "❌"
+                st.write(f"{emoji_s} **{feature} is{' ' if is_sufficient else ' not '}sufficient**")
+        except Exception as e:
+            st.error(f"Error during tests for {feature}: {str(e)}")
+
 
 
 st.header("BoostedXAI: :blue[Anchors] and :orange[Counterfactuals]", divider=True)
@@ -46,36 +95,12 @@ with st.container(border=True):
             if "temp" not in os.listdir():
                 os.mkdir("./temp")
 
-            save_path = os.path.join("./temp", modelfile.name)
-            with open(save_path, "wb") as f:
+            with open("./temp/temp_model.modelfile", "wb") as f:
                 f.write(modelfile.getvalue())
+            with open("./temp/temp_model.modelfile", "rb") as f:
+                model = dill.load(f)
 
-            model = None
-            # try dill
-            try:
-                with open(save_path, "rb") as f:
-                    model = dill.load(f)
-            except Exception:
-                pass
-            # then joblib
-            if model is None:
-                try:
-                    model = joblib.load(save_path)
-                except Exception:
-                    pass
-            # finally pickle
-            if model is None:
-                try:
-                    with open(save_path, "rb") as f:
-                        model = pickle.load(f)
-                except Exception:
-                    pass
-
-            if model is None:
-                st.error("Could not load model file; tried dill, joblib, and pickle.")
-            else:
-                st.session_state["model"] = model
-                st.success("Custom model loaded.")
+            st.session_state["model"] = model
 
 
 if datafile:
@@ -169,7 +194,8 @@ if datafile:
     if target and not custom and "model" not in st.session_state:
         X_encoded = st.session_state["encoded_data"].copy()
         y_encoded = data[target]
-        model, acc = train_mlp(X_encoded, y_encoded)
+        with st.spinner("Training MLP..."):
+            model, acc = train_mlp(X_encoded, y_encoded)
         st.session_state["model"] = model
         st.session_state["acc"] = acc
         st.success(f"Model trained with accuracy: {acc:.2%}")
@@ -295,3 +321,7 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
                 else:
                     st.success("✅ Counterfactuals AGREE - they don't change anchor features")
                     st.caption("Anchor features are stable; other features drive the change")
+
+        # Necessity and Sufficiency Tests
+        with st.container(border=True):
+            nec_and_suf_ui(exp_dice, instance_df, desired_class, anchor_features)
