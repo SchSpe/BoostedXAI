@@ -10,6 +10,8 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+import pickle
+import joblib
 
 def train_mlp(X, y):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -32,16 +34,48 @@ with st.container(border=True):
         modelfile = st.file_uploader("Upload Model", type=["pkl", "joblib", "modelfile"])
 
         if modelfile:
+            backend_choice = st.segmented_control(
+                "Select model type for DiCE",
+                options=["sklearn", "TF2", "PYT", "TF1"],
+                selection_mode="single",
+                key="dice_backend"
+            )
+            st.caption(f"DiCE backend set to: {backend_choice}")
+
             # Getting model from uploaded file
             if "temp" not in os.listdir():
                 os.mkdir("./temp")
 
-            with open("./temp/temp_model.modelfile", "wb") as f:
+            save_path = os.path.join("./temp", modelfile.name)
+            with open(save_path, "wb") as f:
                 f.write(modelfile.getvalue())
-            with open("./temp/temp_model.modelfile", "rb") as f:
-                model = dill.load(f)
 
-            st.session_state["model"] = model
+            model = None
+            # try dill
+            try:
+                with open(save_path, "rb") as f:
+                    model = dill.load(f)
+            except Exception:
+                pass
+            # then joblib
+            if model is None:
+                try:
+                    model = joblib.load(save_path)
+                except Exception:
+                    pass
+            # finally pickle
+            if model is None:
+                try:
+                    with open(save_path, "rb") as f:
+                        model = pickle.load(f)
+                except Exception:
+                    pass
+
+            if model is None:
+                st.error("Could not load model file; tried dill, joblib, and pickle.")
+            else:
+                st.session_state["model"] = model
+                st.success("Custom model loaded.")
 
 
 if datafile:
@@ -131,14 +165,16 @@ if datafile:
         else:
             st.info("No categorical features selected.")
 
-    # Train model if not using custom model
-    if target and not custom:
+    # Train model if not using custom model, only once per session
+    if target and not custom and "model" not in st.session_state:
         X_encoded = st.session_state["encoded_data"].copy()
         y_encoded = data[target]
-
         model, acc = train_mlp(X_encoded, y_encoded)
         st.session_state["model"] = model
+        st.session_state["acc"] = acc
         st.success(f"Model trained with accuracy: {acc:.2%}")
+    elif target and not custom:
+        st.info(f"Using existing model (accuracy: {st.session_state.get('acc', float('nan')):.2%})")
 
 # Initialize Anchor Explainer
 if "data_matrix" in st.session_state and "model" in st.session_state and "target_feature" in st.session_state:
@@ -166,6 +202,7 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
             st.dataframe(pd.DataFrame([row], columns=features), hide_index=True)
 
         col1, col2 = st.columns(2)
+        # Anchor explanation
         with col1:
             exp = explainer.explain_instance(row, st.session_state["model"].predict, threshold=0.95)
             with st.container(border=True):
@@ -173,6 +210,7 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
                 st.write('Anchor: %s' % (' AND '.join(exp.names())))
                 st.write('Precision: %.2f' % exp.precision())
                 st.write('Coverage: %.2f' % exp.coverage())
+        # Counterfactual explanation
         with col2:
             with st.container(border=True):
                 st.subheader("Counterfactual Explanation")
@@ -192,21 +230,22 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
                             continuous_features=cont_features,
                             outcome_name=target
                         )
-                        model_dice = dice_ml.Model(model=st.session_state["model"], backend="sklearn")
+                        backend = st.session_state.get("dice_backend", "sklearn") if custom else "sklearn"
+                        model_dice = dice_ml.Model(model=st.session_state["model"], backend=backend)
+                        st.caption(f"Using DiCE backend: {backend}")
                         exp_dice = dice_ml.Dice(data_dice, model_dice, method='random')
 
-                        classes = getattr(st.session_state["model"], 'classes_', np.array(st.session_state.get('class_names', [])))
-                        n_classes = len(classes)
                         instance_df = pd.DataFrame([row], columns=features)
-                        if n_classes == 2:
+
+                        # Derive labels directly from the target column to avoid type mismatches
+                        labels = pd.Series(train_df[target]).dropna().unique().tolist()
+
+                        if len(labels) == 2:
                             desired_class = "opposite"
                         else:
-                            current_pred = st.session_state["model"].predict(instance_df.to_numpy())[0]
-                            try:
-                                i = int(np.where(classes == current_pred)[0][0])
-                                desired_class = classes[(i + 1) % n_classes]
-                            except Exception:
-                                desired_class = classes[0] if n_classes else 0
+                            current_pred = st.session_state["model"].predict(instance_df)[0]
+                            # Pick any label different from the current prediction (guaranteed same dtype)
+                            desired_class = next((lbl for lbl in labels if lbl != current_pred), labels[0])
 
                         cf = exp_dice.generate_counterfactuals(
                             instance_df,
