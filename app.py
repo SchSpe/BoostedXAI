@@ -65,9 +65,11 @@ def nec_and_suf_ui(exp_dice, instance_df, desired_class, anchor_features):
             with col1:
                 emoji_n = "✅" if is_necessary else "❌"
                 st.write(f"{emoji_n} **{feature} is{' ' if is_necessary else ' not '}necessary**")
+                st.caption("Changing this feature can change the prediction." if is_necessary else "Changing this feature does not change the prediction.")
             with col2:
                 emoji_s = "✅" if is_sufficient else "❌"
                 st.write(f"{emoji_s} **{feature} is{' ' if is_sufficient else ' not '}sufficient**")
+                st.caption("Keeping this feature constant keeps the prediction the same." if is_sufficient else "Keeping this feature constant does not guarantee the same prediction.")
         except Exception as e:
             st.error(f"Error during tests for {feature}: {str(e)}")
 
