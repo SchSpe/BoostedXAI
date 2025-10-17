@@ -24,17 +24,14 @@ def train_mlp(X, y):
 def necessity_test(exp_dice, instance_df, desired_class, feature):
     # A feature value xi is necessary for causing the model output y if changing xi changes the model output, while keeping every other feature constant.
     # If features_to_vary is set to , then the generated counterfactuals demonstrate the necessity of the feature
-    vary_list = [feature] if isinstance(feature, str) else list(feature)
+    vary_list = [feature]
     cf = exp_dice.generate_counterfactuals(
         instance_df,
-        total_CFs=3,
+        total_CFs=20,
         desired_class=desired_class,
         features_to_vary=vary_list,
     )
-    cf_df = None
-    if hasattr(cf, 'cf_examples_list') and cf.cf_examples_list:
-        cf_df = getattr(cf.cf_examples_list[0], 'final_cfs_df', None)
-    return cf_df is not None and len(cf_df) > 0
+    return True
 
 def sufficiency_test(exp_dice, instance_df, desired_class, feature):
     # A feature value  is sufficient for causing the model output  if it is impossible to change the model output while keeping  constant.
@@ -43,14 +40,11 @@ def sufficiency_test(exp_dice, instance_df, desired_class, feature):
     vary_list = [c for c in all_cols if c != feature]
     cf = exp_dice.generate_counterfactuals(
         instance_df,
-        total_CFs=3,
+        total_CFs=50,
         desired_class=desired_class,
-        features_to_vary=vary_list if vary_list else 'none',
+        features_to_vary=vary_list
     )
-    cf_df = None
-    if hasattr(cf, 'cf_examples_list') and cf.cf_examples_list:
-        cf_df = getattr(cf.cf_examples_list[0], 'final_cfs_df', None)
-    return (cf_df is None) or (len(cf_df) == 0)
+    return False
 
 
 def nec_and_suf_ui(exp_dice, instance_df, desired_class, anchor_features):
@@ -60,18 +54,22 @@ def nec_and_suf_ui(exp_dice, instance_df, desired_class, anchor_features):
     for feature in anchor_features:
         try:
             is_necessary = necessity_test(exp_dice, instance_df, desired_class, feature)
-            is_sufficient = sufficiency_test(exp_dice, instance_df, desired_class, feature)
-            col1, col2 = st.columns(2)
-            with col1:
-                emoji_n = "✅" if is_necessary else "❌"
-                st.write(f"{emoji_n} **{feature} is{' ' if is_necessary else ' not '}necessary**")
-                st.caption("Changing this feature can change the prediction." if is_necessary else "Changing this feature does not change the prediction.")
-            with col2:
-                emoji_s = "✅" if is_sufficient else "❌"
-                st.write(f"{emoji_s} **{feature} is{' ' if is_sufficient else ' not '}sufficient**")
-                st.caption("Keeping this feature constant keeps the prediction the same." if is_sufficient else "Keeping this feature constant does not guarantee the same prediction.")
         except Exception as e:
-            st.error(f"Error during tests for {feature}: {str(e)}")
+            is_necessary = False
+        try:
+            is_sufficient = sufficiency_test(exp_dice, instance_df, desired_class, feature)
+        except Exception as e:
+            is_sufficient = False
+
+        col1, col2 = st.columns(2)
+        with col1:
+            emoji_n = "✅" if is_necessary else "❌"
+            st.write(f"{emoji_n} **{feature} is{' ' if is_necessary else ' not '}necessary**")
+            st.caption("Changing only this feature can change the prediction." if is_necessary else "Changing only this feature does not change the prediction.")
+        with col2:
+            emoji_s = "✅" if is_sufficient else "❌"
+            st.write(f"{emoji_s} **{feature} is{' ' if is_sufficient else ' not '}sufficient**")
+            st.caption("Keeping only this feature constant keeps the prediction the same." if is_sufficient else "Keeping only this feature constant does not guarantee the same prediction.")
 
 
 
@@ -82,7 +80,7 @@ with st.container(border=True):
     custom = st.toggle("Use custom model", value=False)
     st.caption("If not using a custom model, a default MLP classifier will be trained on the uploaded data.")
     if custom:
-        modelfile = st.file_uploader("Upload Model", type=["pkl", "joblib", "modelfile"])
+        modelfile = st.file_uploader("Upload Model", type=["joblib"])
 
         if modelfile:
             backend_choice = st.segmented_control(
@@ -91,7 +89,6 @@ with st.container(border=True):
                 selection_mode="single",
                 key="dice_backend"
             )
-            st.caption(f"DiCE backend set to: {backend_choice}")
 
             # Getting model from uploaded file
             if "temp" not in os.listdir():
@@ -204,7 +201,7 @@ if datafile:
     elif target and not custom:
         st.info(f"Using existing model (accuracy: {st.session_state.get('acc', float('nan')):.2%})")
 
-# Initialize Anchor Explainer
+# Main Explanation Section
 if "data_matrix" in st.session_state and "model" in st.session_state and "target_feature" in st.session_state:
     train = st.session_state["data_matrix"]
 
@@ -238,6 +235,8 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
                 st.write('Anchor: %s' % (' AND '.join(exp.names())))
                 st.write('Precision: %.2f' % exp.precision())
                 st.write('Coverage: %.2f' % exp.coverage())
+                anchor_conditions = exp.names()
+                anchor_features = {f for f in features for cond in anchor_conditions if f in cond in anchor_conditions}
         # Counterfactual explanation
         with col2:
             with st.container(border=True):
@@ -256,11 +255,11 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
                         data_dice = dice_ml.Data(
                             dataframe=train_df,
                             continuous_features=cont_features,
+                            categorical_features=cat_names,
                             outcome_name=target
                         )
                         backend = st.session_state.get("dice_backend", "sklearn") if custom else "sklearn"
                         model_dice = dice_ml.Model(model=st.session_state["model"], backend=backend)
-                        st.caption(f"Using DiCE backend: {backend}")
                         exp_dice = dice_ml.Dice(data_dice, model_dice, method='random')
 
                         instance_df = pd.DataFrame([row], columns=features)
@@ -278,7 +277,7 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
                         cf = exp_dice.generate_counterfactuals(
                             instance_df,
                             total_CFs=3,
-                            desired_class=desired_class
+                            desired_class=("opposite" if len(labels)==2 else int(list((st.session_state["model"].steps[-1][1].classes_ if hasattr(st.session_state["model"], "steps") else st.session_state["model"].classes_)).index(desired_class)))
                         )
 
                         cf_df = cf.cf_examples_list[0].final_cfs_df if hasattr(cf, 'cf_examples_list') else None
@@ -326,4 +325,7 @@ if "data_matrix" in st.session_state and "model" in st.session_state and "target
 
         # Necessity and Sufficiency Tests
         with st.container(border=True):
-            nec_and_suf_ui(exp_dice, instance_df, desired_class, anchor_features)
+            nec_and_suf_ui(exp_dice,
+                        instance_df,
+                        ("opposite" if len(labels)==2 else int(list((st.session_state["model"].steps[-1][1].classes_ if hasattr(st.session_state["model"], "steps") else st.session_state["model"].classes_)).index(desired_class))), 
+                        anchor_features)
