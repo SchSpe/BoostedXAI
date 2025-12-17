@@ -10,6 +10,62 @@ from anchor import anchor_tabular
 import dice_ml
 from dice_ml import Dice
 
+def necessity_test(exp_dice, instance_df, desired_class, feature):
+    """Test if a feature is necessary for the prediction.
+
+    A feature is necessary if changing ONLY that feature can change the prediction.
+    We set features_to_vary to just this feature - if counterfactuals are found,
+    the feature is necessary.
+
+    Returns:
+        bool: True if feature is necessary, False otherwise
+    """
+    try:
+        cf = exp_dice.generate_counterfactuals(
+            instance_df,
+            total_CFs=5,
+            desired_class=desired_class,
+            features_to_vary=[feature],
+        )
+        # Check if any counterfactuals were actually generated
+        cf_df = cf.cf_examples_list[0].final_cfs_df
+        if cf_df is not None and len(cf_df) > 0:
+            return True  # CFs found by varying only this feature → necessary
+        return False
+    except Exception:
+        # No counterfactuals found → not necessary
+        return False
+
+def sufficiency_test(exp_dice, instance_df, desired_class, feature, all_features):
+    """Test if a feature is sufficient for the prediction.
+
+    A feature is sufficient if keeping it constant makes it impossible to change
+    the prediction. We set features_to_vary to all features EXCEPT this one -
+    if NO counterfactuals are found, the feature is sufficient.
+
+    Returns:
+        bool: True if feature is sufficient, False otherwise
+    """
+    vary_list = [f for f in all_features if f != feature]
+    if not vary_list:
+        return True  # If this is the only feature, it's sufficient by default
+
+    try:
+        cf = exp_dice.generate_counterfactuals(
+            instance_df,
+            total_CFs=10,
+            desired_class=desired_class,
+            features_to_vary=vary_list
+        )
+        # Check if any counterfactuals were actually generated
+        cf_df = cf.cf_examples_list[0].final_cfs_df
+        if cf_df is not None and len(cf_df) > 0:
+            return False  # CFs found while keeping this feature constant → not sufficient
+        return True  # No valid CFs → sufficient
+    except Exception:
+        # No counterfactuals found (error) → sufficient
+        return True
+
 def parse_anchors_from_rules(rules, feature_names, training_data):
     """Parse anchor bounds from anchor rules.
     
@@ -88,6 +144,10 @@ if 'training_data' not in st.session_state:
     st.session_state.training_data = None  # Store for analysis
 if 'anchor_runs' not in st.session_state:
     st.session_state.anchor_runs = []  # Store multiple anchor generation runs
+if 'nec_suf_results' not in st.session_state:
+    st.session_state.nec_suf_results = {}  # Store necessity/sufficiency test results
+if 'actionable_features' not in st.session_state:
+    st.session_state.actionable_features = {}  # Maps feature -> bool (actionable or not)
 
 # Title
 st.title("🔍 Explainable AI: Anchors & Counterfactuals")
@@ -115,7 +175,62 @@ with st.sidebar:
             
             if target_col:
                 st.session_state.target_name = target_col
-                
+
+                # Pre-compute numeric features for configuration
+                X_temp = df.drop(columns=[target_col])
+                numeric_features = X_temp.select_dtypes(include=[np.number]).columns.tolist()
+
+                # Initialize feature types and actionability if not already set
+                if 'feature_types' not in st.session_state or set(st.session_state.feature_types.keys()) != set(numeric_features):
+                    feature_types = {}
+                    for col in numeric_features:
+                        n_unique = X_temp[col].nunique()
+                        if n_unique <= 10:
+                            feature_types[col] = 'categorical'
+                        else:
+                            feature_types[col] = 'continuous'
+                    st.session_state.feature_types = feature_types
+
+                if 'actionable_features' not in st.session_state or set(st.session_state.actionable_features.keys()) != set(numeric_features):
+                    for col in numeric_features:
+                        st.session_state.actionable_features[col] = True
+
+                # Feature Configuration Questionnaire
+                st.divider()
+                st.subheader("2. Configure Features")
+
+                for feature in numeric_features:
+                    current_type = st.session_state.feature_types.get(feature, 'continuous')
+                    current_actionable = st.session_state.actionable_features.get(feature, True)
+
+                    with st.container():
+                        st.markdown(f"**{feature}**")
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            is_categorical = st.checkbox(
+                                "Categorical",
+                                value=(current_type == 'categorical'),
+                                key=f"type_{feature}"
+                            )
+                            st.session_state.feature_types[feature] = 'categorical' if is_categorical else 'continuous'
+
+                        with col2:
+                            is_actionable = st.checkbox(
+                                "Actionable",
+                                value=current_actionable,
+                                key=f"actionable_{feature}"
+                            )
+                            st.session_state.actionable_features[feature] = is_actionable
+
+                with st.expander("ℹ️ What do these mean?"):
+                    st.markdown("""
+                    - **Categorical**: Discrete values (0/1, ratings)
+                    - **Actionable**: Can be changed in practice
+                    """)
+
+                st.divider()
+
                 # Train button
                 if st.button("3. Train MLP Model", type="primary"):
                     with st.spinner("Training model..."):
@@ -134,24 +249,14 @@ with st.sidebar:
                             
                             # Store feature statistics
                             feature_stats = {}
-                            feature_types = {}
                             for col in numeric_features:
                                 feature_stats[col] = {
                                     'min': float(X[col].min()),
                                     'max': float(X[col].max()),
                                     'mean': float(X[col].mean())
                                 }
-                                
-                                # Auto-detect if categorical (few unique values)
-                                n_unique = X[col].nunique()
-                                if n_unique <= 10:
-                                    feature_types[col] = 'categorical'
-                                else:
-                                    feature_types[col] = 'continuous'
-                            
                             st.session_state.feature_stats = feature_stats
-                            st.session_state.feature_types = feature_types
-                            
+
                             # Store training data for analysis
                             st.session_state.training_data = X
                             
@@ -181,9 +286,9 @@ with st.sidebar:
                             st.success("✓ Classification model trained!")
                             st.metric("Accuracy", f"{accuracy*100:.1f}%")
                             
-                            # Initialize feature values to means
+                            # Initialize feature values to first instance
                             for col in numeric_features:
-                                st.session_state.feature_values[col] = float(X[col].mean())
+                                st.session_state.feature_values[col] = float(X[col].iloc[0])
                         
                         except Exception as e:
                             st.error(f"Training failed: {str(e)}")
@@ -204,7 +309,7 @@ with st.sidebar:
         st.subheader("🔍 Generate Explanations")
         
         # Anchor generation with multiple runs
-        num_anchor_runs = st.slider("Number of anchor runs", 1, 5, 3, key="num_anchor_runs")
+        num_anchor_runs = st.number_input("Number of anchor runs", min_value=1, max_value=5, value=1, key="num_anchor_runs")
         
         if st.button("Generate Anchors", use_container_width=True):
             with st.spinner(f"Computing anchors ({num_anchor_runs} runs)..."):
@@ -322,13 +427,22 @@ with st.sidebar:
                     model_type='classifier'
                 )
                 exp = Dice(d, m, method='random')
-                
+
                 query_df = pd.DataFrame([st.session_state.feature_values])
-                
+
+                # Get actionable features only for CF visualization
+                actionable_features = [f for f in st.session_state.feature_names
+                                       if st.session_state.actionable_features.get(f, True)]
+
+                if not actionable_features:
+                    st.warning("No actionable features selected. Using all features.")
+                    actionable_features = st.session_state.feature_names
+
                 dice_exp = exp.generate_counterfactuals(
                     query_df,
                     total_CFs=num_cfs,
-                    desired_class="opposite"
+                    desired_class="opposite",
+                    features_to_vary=actionable_features
                 )
                 
                 cf_df = dice_exp.cf_examples_list[0].final_cfs_df
@@ -342,6 +456,42 @@ with st.sidebar:
                 
                 st.session_state.counterfactuals = counterfactuals
                 st.success(f"✓ Generated {len(counterfactuals)} counterfactuals!")
+
+                # Automatically run necessity/sufficiency tests on anchor features
+                if st.session_state.anchors:
+                    test_features = list(st.session_state.anchors.keys())
+                    st.info(f"Running causal tests on anchor features: {', '.join(test_features)}")
+
+                    results = {}
+                    progress_bar = st.progress(0)
+                    total_tests = len(test_features) * 2
+
+                    for i, feature in enumerate(test_features):
+                        is_necessary = necessity_test(
+                            exp,
+                            query_df,
+                            "opposite",
+                            feature
+                        )
+                        progress_bar.progress((i * 2 + 1) / total_tests)
+
+                        is_sufficient = sufficiency_test(
+                            exp,
+                            query_df,
+                            "opposite",
+                            feature,
+                            st.session_state.feature_names
+                        )
+                        progress_bar.progress((i * 2 + 2) / total_tests)
+
+                        results[feature] = {
+                            'necessary': is_necessary,
+                            'sufficient': is_sufficient
+                        }
+
+                    progress_bar.empty()
+                    st.session_state.nec_suf_results = results
+                    st.success("✓ Causal tests complete!")
 
 # Main content
 if st.session_state.model is not None:
@@ -372,53 +522,28 @@ if st.session_state.model is not None:
             cf_violations_map[cf_idx] = {'violates': violates, 'features': feature_violations}
         
         st.session_state.cf_violations = cf_violations_map
-    
-    # Feature type configuration
-    if st.session_state.feature_names:
-        st.divider()
-        st.header("🏷️ Feature Types")
-        st.markdown("*Auto-detected. Click to override if needed.*")
-        
-        # Create columns for feature type toggles
-        num_features = len(st.session_state.feature_names)
-        cols_per_row = 3
-        
-        for i in range(0, num_features, cols_per_row):
-            cols = st.columns(cols_per_row)
-            for j in range(cols_per_row):
-                if i + j < num_features:
-                    feature = st.session_state.feature_names[i + j]
-                    current_type = st.session_state.feature_types.get(feature, 'continuous')
-                    
-                    with cols[j]:
-                        is_categorical = st.checkbox(
-                            f"**{feature}**\nCategorical?",
-                            value=(current_type == 'categorical'),
-                            key=f"type_{feature}",
-                            help=f"Currently: {current_type.title()}"
-                        )
-                        
-                        if is_categorical:
-                            st.session_state.feature_types[feature] = 'categorical'
-                        else:
-                            st.session_state.feature_types[feature] = 'continuous'
-        
-        st.caption("📌 Categorical features: Use for discrete values (e.g., 0/1, ratings 1-5). Continuous: Use for measurements (e.g., age, income).")
-    
-    st.divider()
-    
+
     # Visualization
-    st.header("📊 Feature Visualization")
+    st.header("📊 Visualization")
     
     if st.session_state.feature_names:
         # Create subplots for all features
         num_features = len(st.session_state.feature_names)
         
+        # Build subplot titles with indicators
+        subplot_titles = []
+        for name in st.session_state.feature_names:
+            title = name
+            if st.session_state.feature_types.get(name, 'continuous') == 'categorical':
+                title += ' 🏷️'
+            if not st.session_state.actionable_features.get(name, True):
+                title += ' 🔒'
+            subplot_titles.append(title)
+
         fig = make_subplots(
-            rows=1, 
+            rows=1,
             cols=num_features,
-            subplot_titles=[f"{name}{' 🏷️' if st.session_state.feature_types.get(name, 'continuous') == 'categorical' else ''}" 
-                          for name in st.session_state.feature_names],
+            subplot_titles=subplot_titles,
             horizontal_spacing=0.05
         )
         
@@ -724,9 +849,67 @@ if st.session_state.model is not None:
                     st.caption("Outside at least one anchor constraint")
                 else:
                     st.info("✅ **Respects Anchor:** None")
-    
+
+    # Verbalized Interpretation
     st.divider()
-    
+    st.header("📝 Interpretation")
+
+    # Get current prediction
+    feature_vector = [st.session_state.feature_values[f] for f in st.session_state.feature_names]
+    X_pred = np.array([feature_vector])
+    X_scaled = st.session_state.scaler.transform(X_pred)
+    prediction = st.session_state.model.predict(X_scaled)[0]
+    probabilities = st.session_state.model.predict_proba(X_scaled)[0]
+    predicted_idx = st.session_state.model.classes_.tolist().index(prediction)
+    confidence = probabilities[predicted_idx] * 100
+
+    # Prediction statement
+    st.markdown(f"**Prediction:** Given this instance, the model predicts **{prediction}** with **{confidence:.1f}%** confidence.")
+
+    # Anchor interpretation
+    if st.session_state.anchor_rules:
+        anchor_text = " AND ".join([f"*{rule}*" for rule in st.session_state.anchor_rules])
+        precision_pct = st.session_state.anchor_precision * 100
+        coverage_pct = st.session_state.anchor_coverage * 100
+
+        st.markdown(f"""
+**Anchor Explanation:** As long as {anchor_text}, the prediction will remain **{prediction}**
+with **{precision_pct:.0f}%** precision. This rule applies to **{coverage_pct:.1f}%** of similar instances.
+""")
+
+    # Counterfactual interpretations
+    if st.session_state.counterfactuals:
+        st.markdown("**Counterfactual Explanations:**")
+
+        for cf_idx, cf in enumerate(st.session_state.counterfactuals):
+            # Find what changed
+            changes = []
+            for feature in st.session_state.feature_names:
+                orig = st.session_state.feature_values[feature]
+                cf_val = cf[feature]
+                if abs(orig - cf_val) > 0.01:
+                    changes.append(f"*{feature}* changed from **{orig:.0f}** to **{cf_val:.0f}**")
+
+            # Check violation status
+            violates = False
+            if cf_idx in st.session_state.cf_violations:
+                violates = st.session_state.cf_violations[cf_idx]['violates']
+
+            if changes:
+                changes_text = ", ".join(changes)
+                if violates:
+                    anchor_status = "This counterfactual lies **inside** the anchor region, so it is outside the local space of the anchor."
+                else:
+                    anchor_status = "This counterfactual lies **outside** the anchor region, so it is inside the local space of the anchor."
+
+                st.markdown(f"""
+- **CF {cf_idx + 1}:** If {changes_text}, the prediction would change to the opposite class. {anchor_status}
+""")
+            else:
+                st.markdown(f"- **CF {cf_idx + 1}:** No significant changes from current instance.")
+
+    st.divider()
+
     # Feature sliders and prediction
     col1, col2 = st.columns([3, 1])
     
@@ -753,12 +936,13 @@ if st.session_state.model is not None:
                         key=f"slider_{feature}"
                     )
                 else:
-                    # Continuous slider
+                    # Continuous slider with integer steps
                     value = st.slider(
                         feature,
                         min_value=stats['min'],
                         max_value=stats['max'],
                         value=st.session_state.feature_values.get(feature, stats['mean']),
+                        step=1.0,
                         key=f"slider_{feature}"
                     )
                 
@@ -856,6 +1040,37 @@ if st.session_state.model is not None:
             - **Rules**: The conditions that define the "anchor" - when these are true, the prediction is stable
             - **Anchor Selection**: Choose which run's anchor rules to display and use for violation checking
             """)
+
+    # Necessity/Sufficiency Results Display
+    if st.session_state.nec_suf_results:
+        st.divider()
+        st.header("🔬 Necessity & Sufficiency Analysis for Anchor Features")
+
+        st.markdown("""
+        **Necessity**: Can changing *only* this feature flip the prediction?
+        **Sufficiency**: Does keeping this feature constant *prevent* prediction changes?
+        """)
+
+        # Create columns for results
+        results = st.session_state.nec_suf_results
+        num_features = len(results)
+
+        # Display results in a table format
+        result_data = []
+        for feature, res in results.items():
+            nec_emoji = "✅" if res['necessary'] else "❌"
+            suf_emoji = "✅" if res['sufficient'] else "❌"
+            result_data.append({
+                'Feature': feature,
+                'Necessary': f"{nec_emoji} {'Yes' if res['necessary'] else 'No'}",
+                'Sufficient': f"{suf_emoji} {'Yes' if res['sufficient'] else 'No'}"
+            })
+
+        st.dataframe(
+            pd.DataFrame(result_data),
+            hide_index=True,
+            use_container_width=True
+        )
 
 else:
     st.info("👈 Upload a CSV file and train a model to get started")
